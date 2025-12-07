@@ -111,7 +111,7 @@ st.title("🎬 BAR Media Production Hub")
 
 # SIDEBAR: Configuration
 # You need to find the Folder ID for "BAR" specifically
-bar_folder_id = Hr442WX8R7GWw9JC2mfx445G7PgPC7P6CHhX6qX1 # <--- REPLACE WITH YOUR BAR FOLDER ID
+bar_folder_id = 7157965225518980 # <--- REPLACE WITH YOUR BAR FOLDER ID
 df = fetch_bar_projects(bar_folder_id)
 
 if not df.empty:
@@ -166,4 +166,5 @@ if not df.empty:
     )
 
 else:
+
     st.info("No data found. Please check your BAR_FOLDER_ID in the code.")
