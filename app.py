@@ -134,7 +134,7 @@ st.set_page_config(page_title="Active Projects Hub", layout="wide")
 st.title("🎬 Active Projects Hub")
 
 # CONFIG: INPUT YOUR 'ACTIVE PROJECTS' FOLDER ID HERE
-active_projects_folder_id = 1234567890123456 
+active_projects_folder_id = 6632675466340228
 
 df = fetch_active_projects(active_projects_folder_id)
 
@@ -192,3 +192,4 @@ if not df.empty:
 
 else:
     st.warning("No data found. Please check your Folder ID at line 123.")
+
