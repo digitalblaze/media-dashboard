@@ -10,7 +10,7 @@ COLUMN_MAPPING = {
     "status": ["Status", "State", "Progress", "% Complete", "Status/Health"],
     "assigned_to": ["Assigned To", "Owner", "Lead", "Editor", "Person", "Producer"],
     "end_date": ["End Date", "Due Date", "Finish", "Target Date", "Deadline"],
-    "start_date": ["Start Date", "Start", "Begin"], # Required for Gantt
+    "start_date": ["Start Date", "Start", "Begin"], 
     "task_name": ["Task Name", "Task", "Activity", "Item", "Primary Column"]
 }
 
@@ -100,6 +100,7 @@ def fetch_active_projects(root_folder_id):
                 end_val = get_val(end_date_id)
                 start_val = get_val(start_date_id)
                 
+                # Keep row if it has an assignee OR a date
                 if assignee or end_val:
                     all_rows.append({
                         "Project": context_name,
@@ -128,10 +129,16 @@ active_projects_folder_id = 6632675466340228
 df = fetch_active_projects(active_projects_folder_id)
 
 if not df.empty:
-    # --- DATE CLEANUP ---
+    # --- DATE CLEANUP (The Fix) ---
     df["End Date"] = pd.to_datetime(df["End Date"], errors='coerce')
     df["Start Date"] = pd.to_datetime(df["Start Date"], errors='coerce')
-    df["Start Date"] = df["Start Date"].fillna(df["End Date"]) # Fallback for Gantt
+    
+    # CRITICAL FIX: If Start Date is missing, make it equal to End Date
+    # This ensures "Milestones" still appear on the Gantt chart
+    df["Start Date"] = df["Start Date"].fillna(df["End Date"]) 
+    
+    # Remove rows where even the End Date is missing (cannot plot those)
+    df = df.dropna(subset=["End Date"])
     
     today = pd.Timestamp.now()
     next_week = today + timedelta(days=7)
@@ -151,26 +158,32 @@ if not df.empty:
     # 1. GANTT CHART
     # ==========================================
     st.subheader(f"📅 Project Timeline: {selected_person}")
-    gantt_data = display_df.dropna(subset=["Start Date", "End Date"]).copy()
+    
+    # Prepare data: Make sure we have at least one valid date
+    gantt_data = display_df.copy()
     
     if not gantt_data.empty:
         gantt_data = gantt_data.sort_values("Start Date")
+        
         fig = px.timeline(
             gantt_data, 
-            x_start="Start Date", x_end="End Date", 
-            y="Task", color="Project",
+            x_start="Start Date", 
+            x_end="End Date", 
+            y="Task", 
+            color="Project",
             hover_data=["Status", "Assigned To"],
-            height=400 + (len(gantt_data) * 10) # Auto-adjust height
+            height=400 + (len(gantt_data) * 20) # Auto-adjust height so it's not squished
         )
+        # Fix the axis so tasks read top-to-bottom
         fig.update_yaxes(autorange="reversed") 
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("No dates available for timeline view.")
+        st.info("No tasks with valid dates found for timeline.")
 
     st.divider()
 
     # ==========================================
-    # 2. SLIPPAGE METER (Restored!)
+    # 2. SLIPPAGE METER
     # ==========================================
     st.header("🚨 Slippage Meter")
     overdue_df = display_df[(display_df["End Date"] < today) & (~display_df["Status"].isin(done_statuses))]
@@ -187,16 +200,12 @@ if not df.empty:
     st.divider()
 
     # ==========================================
-    # 3. WORKLOAD HEATMAP (Restored!)
+    # 3. WORKLOAD HEATMAP
     # ==========================================
     st.header("🔥 Workload Heatmap")
-    
-    # Filter for active work only
     active_work = display_df[~display_df["Status"].isin(done_statuses)]
     
     if not active_work.empty:
-        # If showing "All", show bar chart of everyone. 
-        # If showing specific person, show breakdown by Project.
         if selected_person == "All":
             counts = active_work["Assigned To"].value_counts()
             st.bar_chart(counts, color="#FF4B4B")
