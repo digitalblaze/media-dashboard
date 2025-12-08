@@ -6,10 +6,19 @@ from datetime import datetime, timedelta
 import time
 
 # --- CONFIGURATION ---
-# PASTE YOUR ACTIVE PROJECTS FOLDER ID HERE
-ROOT_ID = 6632675466340228 # <--- MAKE SURE THIS IS YOUR FOLDER ID
+# Your "Active Projects" Folder ID
+ROOT_ID = 6632675466340228 # <--- PASTE YOUR FOLDER ID HERE AGAIN
 
 TARGET_FILE_KEYWORD = "Project Plan"
+
+# ✅ UPDATED MAPPING: Prioritizes 'Finish Date' over 'End Date'
+COLUMN_MAPPING = {
+    "status": ["Status", "% Complete", "Progress"],
+    "assigned_to": ["Assigned To", "Project Owner", "Functional Owner"],
+    "start_date": ["Start Date", "Target Start Date"],
+    "end_date": ["Finish Date", "End Date", "Target End Date", "Due Date"], # <--- FIX IS HERE
+    "task_name": ["Task Name", "Project Name", "Task"]
+}
 
 # --- AUTHENTICATION ---
 try:
@@ -19,9 +28,9 @@ except Exception as e:
     st.error(f"API Connection Failed: {e}")
     st.stop()
 
-# --- HELPER: FUZZY COLUMN MATCHER ---
+# --- HELPER: COLUMN FINDER ---
 def get_col_id(sheet, possible_names):
-    # Normalize the sheet columns (strip spaces, lowercase)
+    # Normalize column names to avoid case/space issues
     sheet_cols = {c.title.strip().lower(): c.id for c in sheet.columns}
     
     for name in possible_names:
@@ -30,27 +39,25 @@ def get_col_id(sheet, possible_names):
             return sheet_cols[clean_name]
     return None
 
-# --- CORE LOGIC ---
+# --- CORE LOGIC: RECURSIVE SCANNER ---
 @st.cache_data(ttl=600)
-def fetch_debug_data(root_id):
+def fetch_final_data(root_id):
     all_rows = []
     found_sheets = []
     
-    # 1. Connect (Auto-Detect Workspace vs Folder)
+    # 1. Connect
     try:
+        # Try as Workspace first
         root_obj = ss_client.Workspaces.get_workspace(root_id)
-        root_type = "Workspace"
     except:
         try:
+            # Try as Folder second
             root_obj = ss_client.Folders.get_folder(root_id)
-            root_type = "Folder"
         except:
             st.error(f"❌ ID {root_id} is invalid.")
             return pd.DataFrame()
 
-    st.success(f"✅ Connected to {root_type}: {root_obj.name}")
-
-    # 2. Recursive Scan
+    # 2. Scan for Sheets
     def scan(container):
         if hasattr(container, 'sheets'):
             for s in container.sheets:
@@ -59,97 +66,140 @@ def fetch_debug_data(root_id):
         if hasattr(container, 'folders'):
             for f in container.folders:
                 try:
-                    # Must fetch full folder
                     full = ss_client.Folders.get_folder(f.id)
                     scan(full)
                 except: continue
                 
     scan(root_obj)
-    st.info(f"📂 Found {len(found_sheets)} sheets. Extracting raw data...")
-
-    # 3. Extract Data (NO FILTERS - GET EVERYTHING)
+    
+    # 3. Extract Data
     progress = st.progress(0)
     for i, item in enumerate(found_sheets):
         progress.progress((i+1)/len(found_sheets))
         try:
             sheet = ss_client.Sheets.get_sheet(item["sheet"].id)
             
-            # Match Columns (Fuzzy Match)
-            status_id = get_col_id(sheet, ["Status", "% Complete", "Progress"])
-            assign_id = get_col_id(sheet, ["Assigned To", "Project Owner", "Functional Owner"])
-            end_id = get_col_id(sheet, ["End Date", "Finish Date", "Target End Date", "Due Date"])
-            start_id = get_col_id(sheet, ["Start Date", "Target Start Date", "Start"])
-            task_id = get_col_id(sheet, ["Task Name", "Project Name", "Task", "Activity"])
+            # Map Columns
+            status_id = get_col_id(sheet, COLUMN_MAPPING["status"])
+            assign_id = get_col_id(sheet, COLUMN_MAPPING["assigned_to"])
+            start_id = get_col_id(sheet, COLUMN_MAPPING["start_date"])
+            end_id = get_col_id(sheet, COLUMN_MAPPING["end_date"])
+            task_id = get_col_id(sheet, COLUMN_MAPPING["task_name"])
 
             for row in sheet.rows:
                 def get_val(cid):
-                    if not cid: return "MISSING_COL"
+                    if not cid: return None
                     cell = next((c for c in row.cells if c.column_id == cid), None)
                     return cell.display_value if cell else None
 
-                # APPEND EVERYTHING - DO NOT FILTER YET
-                all_rows.append({
-                    "Project": item["context"],
-                    "Sheet": sheet.name,
-                    "Task": get_val(task_id),
-                    "Status": get_val(status_id),
-                    "Assigned To": get_val(assign_id),
-                    "Start Date": get_val(start_id),
-                    "End Date": get_val(end_id),
-                    "Raw Link": row.permalink
-                })
+                # Extract
+                assignee = get_val(assign_id)
+                end_val = get_val(end_id)
+                start_val = get_val(start_id)
+
+                # Keep if it has data
+                if assignee or end_val:
+                    all_rows.append({
+                        "Project": item["context"],
+                        "Task": get_val(task_id) or "Untitled",
+                        "Status": get_val(status_id) or "Not Started",
+                        "Assigned To": assignee or "Unassigned",
+                        "Start Date": start_val,
+                        "End Date": end_val,
+                        "Link": row.permalink
+                    })
         except: continue
         
     progress.empty()
     return pd.DataFrame(all_rows)
 
-# --- UI ---
-st.set_page_config(layout="wide", page_title="Debug Dashboard")
-st.title("🕵️ Data Inspector Mode")
+# --- UI LAYOUT ---
+st.set_page_config(layout="wide", page_title="Media Hub")
+st.title("🚀 Project Media Hub")
 
-df = fetch_debug_data(ROOT_ID)
+df = fetch_final_data(ROOT_ID)
 
 if not df.empty:
-    st.write(f"**Raw Rows Found:** {len(df)}")
+    # --- DATA CLEANUP ---
+    # Parse Dates
+    df["End Date"] = pd.to_datetime(df["End Date"], errors='coerce')
+    df["Start Date"] = pd.to_datetime(df["Start Date"], errors='coerce')
     
-    # 1. RAW DATA PREVIEW (See what we actually got)
-    with st.expander("🔍 Click to Inspect Raw Data (First 20 Rows)", expanded=True):
-        st.dataframe(df.head(20))
-
-    # 2. DATE PARSING ATTEMPT
-    # We clean the dates carefully
-    df["Clean End Date"] = pd.to_datetime(df["End Date"], errors='coerce')
-    df["Clean Start Date"] = pd.to_datetime(df["Start Date"], errors='coerce')
+    # Fill missing start dates for Gantt
+    df["Start Date"] = df["Start Date"].fillna(df["End Date"])
     
-    # Check how many dates failed parsing
-    failed_dates = df[df["End Date"].notnull() & df["Clean End Date"].isnull()]
-    if not failed_dates.empty:
-        st.warning(f"⚠️ Warning: {len(failed_dates)} rows have dates we couldn't read.")
-        st.write("Examples of bad dates:", failed_dates[["End Date"]].head())
-
-    # 3. NOW APPLY FILTERS (Only valid rows)
-    # Fill missing start dates with end dates for Gantt
-    df["Clean Start Date"] = df["Clean Start Date"].fillna(df["Clean End Date"])
+    # Remove rows with no valid dates
+    df = df.dropna(subset=["End Date"])
     
-    # Valid Data for Dashboard
-    valid_df = df.dropna(subset=["Clean End Date"])
+    today = pd.Timestamp.now()
+    next_week = today + timedelta(days=7)
+    done_statuses = ["Complete", "Done", "Shipped", "Cancelled", "Green", "Blue"]
 
-    if not valid_df.empty:
-        st.success(f"🎉 We have {len(valid_df)} valid rows for the timeline!")
-        
-        # GANTT
-        st.subheader("📅 Timeline")
-        fig = px.timeline(valid_df.sort_values("Clean Start Date"), 
-                          x_start="Clean Start Date", x_end="Clean End Date", 
-                          y="Task", color="Project", hover_data=["Status", "Assigned To"])
-        fig.update_yaxes(autorange="reversed")
-        st.plotly_chart(fig, use_container_width=True)
-
-        # TABLE
-        st.subheader("📋 Full Data")
-        st.dataframe(valid_df[["Project", "Task", "Status", "Clean End Date", "Assigned To"]])
+    # --- FILTER ---
+    people = sorted([x for x in df["Assigned To"].unique() if x is not None])
+    selected_person = st.sidebar.selectbox("Filter by Person", ["All"] + people)
+    
+    if selected_person != "All":
+        display_df = df[df["Assigned To"] == selected_person]
     else:
-        st.error("❌ We found data, but after filtering for valid dates, nothing was left. Check the 'Raw Data' above to see why your dates are failing.")
+        display_df = df
+
+    # 1. GANTT
+    st.subheader(f"📅 Timeline: {selected_person}")
+    if not display_df.empty:
+        gantt = display_df.sort_values("Start Date")
+        fig = px.timeline(
+            gantt, 
+            x_start="Start Date", x_end="End Date", 
+            y="Task", color="Project",
+            hover_data=["Status", "Assigned To"],
+            height=400 + (len(gantt) * 10)
+        )
+        fig.update_yaxes(autorange="reversed") 
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No timeline data.")
+
+    st.divider()
+
+    # 2. SLIPPAGE
+    st.subheader("🚨 Slippage Meter")
+    overdue = display_df[(display_df["End Date"] < today) & (~display_df["Status"].isin(done_statuses))]
+    
+    c1, c2 = st.columns([1,3])
+    c1.metric("Overdue Tasks", len(overdue), delta=-len(overdue), delta_color="inverse")
+    if not overdue.empty:
+        st.dataframe(overdue[["Project", "Task", "End Date", "Status"]], use_container_width=True, hide_index=True)
+    else:
+        st.success("No overdue items!")
+
+    st.divider()
+
+    # 3. HEATMAP
+    st.subheader("🔥 Workload Heatmap")
+    active = display_df[~display_df["Status"].isin(done_statuses)]
+    if not active.empty:
+        counts = active["Assigned To"].value_counts() if selected_person == "All" else active["Project"].value_counts()
+        st.bar_chart(counts, color="#FF4B4B")
+    else:
+        st.info("No active tasks.")
+
+    st.divider()
+
+    # 4. URGENT
+    st.subheader("⚠️ Due Next 7 Days")
+    urgent = display_df[(display_df["End Date"] >= today) & (display_df["End Date"] <= next_week) & (~display_df["Status"].isin(done_statuses))]
+    if not urgent.empty:
+        for i, row in urgent.iterrows():
+            st.warning(f"**{row['Project']}**: {row['Task']} (Due {row['End Date'].strftime('%Y-%m-%d')})")
+    else:
+        st.success("No urgent items.")
+
+    st.divider()
+
+    # 5. TABLE
+    st.subheader("📋 Detailed Task List")
+    st.dataframe(display_df[["Project", "Task", "Status", "End Date", "Assigned To"]], use_container_width=True, hide_index=True)
 
 else:
-    st.error("❌ No data rows extracted. The script connected but found 0 rows.")
+    st.warning("No Data Found. Please double check that 'Finish Date' is populated in your Smartsheet.")
