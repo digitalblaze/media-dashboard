@@ -2,17 +2,16 @@ import streamlit as st
 import smartsheet
 import pandas as pd
 from datetime import datetime, timedelta
+import time
 
 # --- CONFIGURATION ---
-# 1. COLUMN MAPPING: Ensure these match your actual Smartsheet column names
 COLUMN_MAPPING = {
     "status": ["Status", "State", "Progress", "% Complete", "Status/Health"],
-    "assigned_to": ["Assigned To", "Owner", "Lead", "Editor", "Person"],
+    "assigned_to": ["Assigned To", "Owner", "Lead", "Editor", "Person", "Producer"],
     "date": ["End Date", "Due Date", "Finish", "Target Date", "Deadline"],
-    "task_name": ["Task Name", "Task", "Activity", "Item"]
+    "task_name": ["Task Name", "Task", "Activity", "Item", "Primary Column"]
 }
 
-# 2. TARGET KEYWORD: We only read sheets containing this text
 TARGET_FILE_KEYWORD = "Project Plan" 
 
 # --- AUTHENTICATION ---
@@ -25,66 +24,79 @@ except Exception as e:
 
 # --- HELPER FUNCTIONS ---
 def get_col_id(sheet, possible_names):
-    """Finds the ID of a column by matching names loosely."""
     for col in sheet.columns:
         if col.title in possible_names:
             return col.id
     return None
 
+# --- RECURSIVE FOLDER SCANNER ---
+def scan_folder(folder_obj, found_sheets):
+    """
+    Recursively digs through every sub-folder to find sheets.
+    """
+    try:
+        # We must fetch the full folder object to see what is inside it
+        full_folder = ss_client.Folders.get_folder(folder_obj.id)
+        
+        # 1. Check for Sheets in this folder
+        for sheet in full_folder.sheets:
+            if TARGET_FILE_KEYWORD.lower() in sheet.name.lower():
+                found_sheets.append({
+                    "sheet": sheet,
+                    "project_context": full_folder.name
+                })
+        
+        # 2. Dig deeper into Sub-Folders
+        for sub_folder in full_folder.folders:
+            # Recursive call: The function calls itself!
+            scan_folder(sub_folder, found_sheets)
+            time.sleep(0.1) # Be polite to the API
+            
+    except Exception as e:
+        print(f"Skipping folder {folder_obj.name}: {e}")
+
 @st.cache_data(ttl=600) 
 def fetch_workspace_data(workspace_id):
-    """
-    Scans the entire workspace (root sheets + all subfolders)
-    for any sheet containing 'Project Plan'.
-    """
     all_rows = []
+    found_sheets = []
     
-    try:
-        workspace = ss_client.Workspaces.get_workspace(workspace_id)
-    except Exception as e:
-        st.error(f"Could not load Workspace. Check ID. Error: {e}")
-        return pd.DataFrame()
-    
-    # 1. Build a list of all potential sheets to scan
-    sheets_to_scan = []
-    
-    # Add sheets sitting at the root of the workspace
-    for sheet in workspace.sheets:
-        sheets_to_scan.append({"sheet": sheet, "project_context": "Root Workspace"})
-
-    # Add sheets sitting inside folders (and sub-folders)
-    for folder in workspace.folders:
+    with st.spinner('Scanning workspace... this may take a moment for deep folders.'):
         try:
-            # Fetch folder contents to get sheets
-            full_folder = ss_client.Folders.get_folder(folder.id)
-            for sheet in full_folder.sheets:
-                sheets_to_scan.append({"sheet": sheet, "project_context": folder.name})
-        except:
-            continue
+            # 1. Get the Workspace
+            workspace = ss_client.Workspaces.get_workspace(workspace_id)
+            
+            # 2. Get Root Sheets
+            for sheet in workspace.sheets:
+                if TARGET_FILE_KEYWORD.lower() in sheet.name.lower():
+                    found_sheets.append({"sheet": sheet, "project_context": "Root"})
+            
+            # 3. Start Recursive Scan of Root Folders (e.g., "Active Projects")
+            for folder in workspace.folders:
+                scan_folder(folder, found_sheets)
+                
+        except Exception as e:
+            st.error(f"Workspace Error: {e}")
+            return pd.DataFrame()
 
-    # 2. Iterate through found sheets
-    progress_bar = st.progress(0)
-    total_sheets = len(sheets_to_scan)
-    
-    for i, item in enumerate(sheets_to_scan):
-        progress_bar.progress((i + 1) / total_sheets)
+        # 4. Extract Data from Found Sheets
+        progress_bar = st.progress(0)
+        total_sheets = len(found_sheets)
         
-        sheet_obj = item["sheet"]
-        context_name = item["project_context"]
-        
-        # FILTER: Only process sheets that match our keyword
-        if TARGET_FILE_KEYWORD.lower() in sheet_obj.name.lower():
+        for i, item in enumerate(found_sheets):
+            progress_bar.progress((i + 1) / total_sheets)
+            
+            sheet_obj = item["sheet"]
+            context_name = item["project_context"]
+            
             try:
                 sheet = ss_client.Sheets.get_sheet(sheet_obj.id)
                 
-                # Map Columns
                 status_id = get_col_id(sheet, COLUMN_MAPPING["status"])
                 assign_id = get_col_id(sheet, COLUMN_MAPPING["assigned_to"])
                 date_id = get_col_id(sheet, COLUMN_MAPPING["date"])
                 task_id = get_col_id(sheet, COLUMN_MAPPING["task_name"])
 
                 for row in sheet.rows:
-                    # Helper to get cell value safely
                     def get_val(col_id):
                         if not col_id: return None
                         cell = next((c for c in row.cells if c.column_id == col_id), None)
@@ -93,7 +105,6 @@ def fetch_workspace_data(workspace_id):
                     assignee = get_val(assign_id)
                     due_date_str = get_val(date_id)
                     
-                    # Only collect rows that have an assignee or a date (skips empty rows)
                     if assignee or due_date_str:
                         all_rows.append({
                             "Project": context_name,
@@ -104,107 +115,62 @@ def fetch_workspace_data(workspace_id):
                             "Due Date": due_date_str,
                             "Link": row.permalink
                         })
-            except Exception as e:
-                continue # Skip sheets that trigger errors
+            except:
+                continue
                 
-    progress_bar.empty()
+        progress_bar.empty()
+    
     return pd.DataFrame(all_rows)
 
 # --- DASHBOARD LAYOUT ---
 st.set_page_config(page_title="Product Tracking Hub", layout="wide")
 st.title("🚀 Product Portfolio Dashboard")
 
-# CONFIG: REPLACE WITH YOUR WORKSPACE ID
-# (Get this from the URL: app.smartsheet.com/workspaces/12345...)
-workspace_id = 3438747011311492
+# CONFIG
+workspace_id = 3438747011311492 # Your corrected ID
 
 df = fetch_workspace_data(workspace_id)
 
 if not df.empty:
-    # --- DATA PREP ---
-    # Convert dates to datetime objects
     df["Due Date"] = pd.to_datetime(df["Due Date"], errors='coerce')
     today = pd.Timestamp.now()
-    
-    # Define "Done" statuses to exclude from critical lists
-    done_statuses = ["Complete", "Done", "Shipped", "Cancelled", "Green"]
+    done_statuses = ["Complete", "Done", "Shipped", "Cancelled", "Green", "Complete / Shipped"]
 
-    # ---------------------------------------------------------
-    # 1. THE SLIPPAGE METER (Overdue Tracking)
-    # ---------------------------------------------------------
+    # 1. SLIPPAGE METER
     st.header("🚨 Slippage Meter")
-    st.caption("Tasks that are past their due date and not marked Complete.")
-
-    overdue_df = df[
-        (df["Due Date"] < today) & 
-        (~df["Status"].isin(done_statuses))
-    ]
+    overdue_df = df[(df["Due Date"] < today) & (~df["Status"].isin(done_statuses))]
     
     col1, col2 = st.columns([1, 3])
     with col1:
         st.metric("Overdue Items", len(overdue_df), delta=-len(overdue_df), delta_color="inverse")
     with col2:
         if not overdue_df.empty:
-            st.dataframe(
-                overdue_df[["Project", "Task", "Assigned To", "Due Date", "Status"]].sort_values("Due Date"),
-                use_container_width=True,
-                hide_index=True
-            )
+            st.dataframe(overdue_df[["Project", "Task", "Assigned To", "Due Date", "Status"]], use_container_width=True, hide_index=True)
         else:
-            st.success("No slippage detected. All projects on track!")
+            st.success("No slippage detected!")
 
     st.divider()
 
-    # ---------------------------------------------------------
-    # 2. WORKLOAD HEATMAP (Resource Management)
-    # ---------------------------------------------------------
+    # 2. WORKLOAD HEATMAP
     st.header("🔥 Workload Heatmap")
-    st.caption("Active tasks per person (Completed tasks excluded).")
-
-    # Filter for active work only
     active_work = df[~df["Status"].isin(done_statuses)]
-    
     if not active_work.empty:
-        # Count tasks per person
         workload_counts = active_work["Assigned To"].value_counts()
-        
-        # Display as a Bar Chart
-        st.bar_chart(workload_counts, color="#FF4B4B") # Red bars for visibility
-        
-        # Optional: Expandable view to see the details
-        with st.expander("View Workload Details"):
-            st.dataframe(active_work[["Assigned To", "Project", "Task", "Due Date"]].sort_values("Assigned To"), use_container_width=True)
-    else:
-        st.info("No active work found.")
+        st.bar_chart(workload_counts, color="#FF4B4B")
+        with st.expander("View Details"):
+            st.dataframe(active_work[["Assigned To", "Project", "Task", "Due Date"]], use_container_width=True)
 
     st.divider()
 
-    # ---------------------------------------------------------
-    # 3. THE LOOKAHEAD (Next 30 Days)
-    # ---------------------------------------------------------
+    # 3. LOOKAHEAD
     st.header("🔭 30-Day Lookahead")
-    st.caption("What is coming down the pipeline in the next month?")
-
-    # Filter for dates between Today and Today + 30
     next_30 = today + timedelta(days=30)
-    lookahead_df = df[
-        (df["Due Date"] >= today) & 
-        (df["Due Date"] <= next_30) &
-        (~df["Status"].isin(done_statuses))
-    ]
+    lookahead_df = df[(df["Due Date"] >= today) & (df["Due Date"] <= next_30) & (~df["Status"].isin(done_statuses))]
 
     if not lookahead_df.empty:
-        # Display distinct projects appearing in the next 30 days
-        unique_projects = lookahead_df["Project"].unique()
-        st.write(f"**Projects with upcoming deadlines:** {', '.join(unique_projects)}")
-        
-        st.dataframe(
-            lookahead_df[["Due Date", "Project", "Task", "Assigned To"]].sort_values("Due Date"),
-            use_container_width=True,
-            hide_index=True
-        )
+        st.dataframe(lookahead_df[["Due Date", "Project", "Task", "Assigned To"]].sort_values("Due Date"), use_container_width=True, hide_index=True)
     else:
         st.info("No tasks due in the next 30 days.")
 
 else:
-    st.warning("No data found. Please check your Workspace ID and ensure your sheets contain 'Project Plan' in the name.")
+    st.warning("No data found. The script is now scanning deep folders, so if this persists, please check that your API token has Admin access to this workspace.")
