@@ -1,3 +1,4 @@
 streamlit
 smartsheet-python-sdk
 pandas
+plotly
