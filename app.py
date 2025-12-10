@@ -312,7 +312,7 @@ if not df.empty:
                 """
                 
                 try:
-                    model = genai.GenerativeModel('gemini-1.5-flash')
+                    model = genai.GenerativeModel('gemini-pro')
                     response = model.generate_content(prompt)
                     st.success("Draft Generated!")
                     st.text_area("📧 Email Draft:", value=response.text, height=500)
@@ -321,3 +321,4 @@ if not df.empty:
 
 else:
     st.error("❌ No Data Found. Check Folder ID.")
+
