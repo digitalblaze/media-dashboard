@@ -7,7 +7,7 @@ import time
 
 # --- CONFIGURATION ---
 # PASTE YOUR ACTIVE PROJECTS FOLDER ID HERE
-ROOT_ID = 3438747011311492 
+ROOT_ID = 6632675466340228 
 
 TARGET_FILE_KEYWORD = "Project Plan"
 
@@ -20,20 +20,23 @@ except Exception as e:
     st.stop()
 
 # --- HELPER FUNCTIONS ---
-def get_all_col_ids(sheet, possible_names):
-    found_ids = []
+def get_specific_col_id(sheet, target_names):
+    """
+    Strictly looks for the specific column names we want.
+    """
     sheet_cols = {c.title.strip().lower(): c.id for c in sheet.columns}
-    for name in possible_names:
+    
+    for name in target_names:
         clean_name = name.strip().lower()
         if clean_name in sheet_cols:
-            found_ids.append(sheet_cols[clean_name])
-    return found_ids
+            return sheet_cols[clean_name]
+    return None
 
-def get_first_val(row, col_ids):
-    for cid in col_ids:
-        cell = next((c for c in row.cells if c.column_id == cid), None)
-        if cell and cell.display_value:
-            return cell.display_value
+def get_cell_value(row, col_id):
+    if not col_id: return None
+    cell = next((c for c in row.cells if c.column_id == col_id), None)
+    if cell and cell.display_value:
+        return cell.display_value
     return None
 
 # --- DATA ENGINE ---
@@ -67,45 +70,43 @@ def fetch_data_from_api(root_id):
             return pd.DataFrame()
 
     # 2. DOWNLOAD DATA
-    st.write(f"📂 Found {len(found_sheets)} sheets. Downloading data...")
+    st.write(f"📂 Found {len(found_sheets)} sheets. Reading 'Finish Date' column...")
     progress_bar = st.progress(0)
-    status_text = st.empty()
     
     total_sheets = len(found_sheets)
     
     for i, item in enumerate(found_sheets):
-        current_progress = (i + 1) / total_sheets
-        progress_bar.progress(current_progress)
-        status_text.text(f"Reading file {i+1}/{total_sheets}: {item['sheet'].name}")
+        progress_bar.progress((i + 1) / total_sheets)
         
         try:
             sheet = ss_client.Sheets.get_sheet(item["sheet"].id)
             
-            # Map Columns
-            status_ids = get_all_col_ids(sheet, ["Status", "% Complete", "Progress"])
-            assign_ids = get_all_col_ids(sheet, ["Assigned To", "Project Owner", "Functional Owner"])
-            task_ids = get_all_col_ids(sheet, ["Task Name", "Project Name", "Task", "Activity"])
-            end_date_ids = get_all_col_ids(sheet, ["Finish Date", "End Date", "Target End Date", "Due Date"])
-            start_date_ids = get_all_col_ids(sheet, ["Start Date", "Target Start Date", "Start"])
+            # --- STRICT MAPPING (THE FIX) ---
+            # We explicitly REMOVED "End Date" from this list so it can't grab the empty column.
+            # We ONLY look for "Finish Date" (and "Target End Date" as a fallback).
+            end_date_id = get_specific_col_id(sheet, ["Finish Date", "Target End Date", "Finish"])
+            
+            start_date_id = get_specific_col_id(sheet, ["Start Date", "Target Start Date", "Start"])
+            status_id = get_specific_col_id(sheet, ["Status", "% Complete", "Progress"])
+            assign_id = get_specific_col_id(sheet, ["Assigned To", "Project Owner", "Functional Owner"])
+            task_id = get_specific_col_id(sheet, ["Task Name", "Project Name", "Task", "Activity"])
 
             for row in sheet.rows:
-                task_val = get_first_val(row, task_ids)
+                task_val = get_cell_value(row, task_id)
                 if not task_val: continue
                 
                 all_rows.append({
                     "Project": item["context"],
                     "Task": task_val,
-                    "Status": get_first_val(row, status_ids) or "Not Started",
-                    "Assigned To": get_first_val(row, assign_ids) or "Unassigned",
-                    "Start Date": get_first_val(row, start_date_ids),
-                    "End Date": get_first_val(row, end_date_ids),
+                    "Status": get_cell_value(row, status_id) or "Not Started",
+                    "Assigned To": get_cell_value(row, assign_id) or "Unassigned",
+                    "Start Date": get_cell_value(row, start_date_id),
+                    "End Date": get_cell_value(row, end_date_id), # This will now pull from Finish Date
                     "Link": row.permalink
                 })
         except: continue
         
     progress_bar.empty()
-    status_text.empty()
-    
     return pd.DataFrame(all_rows)
 
 # --- APP STARTUP ---
@@ -135,12 +136,11 @@ if not df.empty:
     table_df = working_df.copy()
     timeline_df = working_df.dropna(subset=["End Date"])
 
-    # --- FIX 1: Normalize Today's Date (Fixes "Midnight Bug") ---
+    # FIX: Normalize Today's Date
     today = pd.Timestamp.now().normalize()
     next_week = today + timedelta(days=7)
     
-    # --- FIX 2: Relaxed Done Statuses (Fixes "Green Trap") ---
-    # Removed "Green" and "Blue" so they count as ACTIVE work
+    # FIX: "Green" is now considered Active, not Done
     done_statuses = ["Complete", "Done", "Shipped", "Cancelled", "Complete / Shipped"]
 
     # FILTER
@@ -160,7 +160,7 @@ if not df.empty:
         fig.update_yaxes(autorange="reversed") 
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("No timeline data found.")
+        st.info("No timeline data found (Finish Date missing).")
 
     st.divider()
 
@@ -187,16 +187,11 @@ if not df.empty:
 
     # 4. URGENT
     st.subheader("⚠️ Due Next 7 Days")
-    # Filters: 
-    # 1. Date is >= Today
-    # 2. Date is <= Next Week
-    # 3. Status is NOT in "Done" list (Green/Blue will now SHOW UP)
     urgent = timeline_df[
         (timeline_df["End Date"] >= today) & 
         (timeline_df["End Date"] <= next_week) & 
         (~timeline_df["Status"].isin(done_statuses))
     ]
-    
     if not urgent.empty:
         for i, row in urgent.iterrows():
             st.warning(f"**{row['Project']}**: {row['Task']} (Due {row['End Date'].strftime('%Y-%m-%d')})")
