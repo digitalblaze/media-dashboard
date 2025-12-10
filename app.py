@@ -2,12 +2,12 @@ import streamlit as st
 import smartsheet
 import pandas as pd
 import plotly.express as px
-import google.generativeai as genai  # <--- NEW LIBRARY
+import google.generativeai as genai
 from datetime import datetime, timedelta
 import time
 
 # --- CONFIGURATION ---
-# PASTE YOUR ACTIVE PROJECTS FOLDER ID HERE
+# Your Active Projects Folder ID
 ROOT_ID = 6632675466340228 
 
 TARGET_FILE_KEYWORD = "Project Plan"
@@ -23,8 +23,6 @@ except Exception as e:
 # Configure Gemini
 if "GOOGLE_API_KEY" in st.secrets:
     genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
-else:
-    st.warning("⚠️ Google API Key missing in Secrets. AI features will be disabled.")
 
 # --- HELPER FUNCTIONS ---
 def get_specific_col_id(sheet, target_names):
@@ -38,7 +36,6 @@ def get_specific_col_id(sheet, target_names):
 def get_cell_value(row, col_id):
     if not col_id: return None
     cell = next((c for c in row.cells if c.column_id == col_id), None)
-    # Check display_value first (formatted), then raw value
     if cell:
         if hasattr(cell, 'display_value') and cell.display_value:
             return cell.display_value
@@ -51,7 +48,6 @@ def fetch_data_from_api(root_id):
     all_rows = []
     found_sheets = []
     
-    # 1. CONNECT & SCAN
     with st.spinner('Connecting to Smartsheet API...'):
         try:
             try:
@@ -76,7 +72,6 @@ def fetch_data_from_api(root_id):
             st.error(f"Connection Error: {e}")
             return pd.DataFrame()
 
-    # 2. DOWNLOAD DATA
     st.write(f"📂 Found {len(found_sheets)} sheets. Downloading data...")
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -90,7 +85,7 @@ def fetch_data_from_api(root_id):
         try:
             sheet = ss_client.Sheets.get_sheet(item["sheet"].id)
             
-            # MAPPING
+            # Mapping
             end_date_id = get_specific_col_id(sheet, ["Finish Date", "Target End Date", "Finish"])
             start_date_id = get_specific_col_id(sheet, ["Start Date", "Target Start Date", "Start"])
             status_id = get_specific_col_id(sheet, ["Status", "% Complete", "Progress"])
@@ -102,7 +97,7 @@ def fetch_data_from_api(root_id):
                 if not task_val: continue
                 
                 all_rows.append({
-                    "Project": item["context"],
+                    "Project": item["context"], # Folder Name is Project Name
                     "Task": task_val,
                     "Status": get_cell_value(row, status_id) or "Not Started",
                     "Assigned To": get_cell_value(row, assign_id) or "Unassigned",
@@ -126,13 +121,12 @@ if st.sidebar.button("🔄 Refresh Data Now"):
         del st.session_state["master_df"]
     st.rerun()
 
-if "master_df" not in st.session_state:
+if "master_df" not in st.session_state or st.session_state["master_df"].empty:
     st.session_state["master_df"] = fetch_data_from_api(ROOT_ID)
 
 df = st.session_state["master_df"]
 
-st.title("🚀 Project Media Hub")
-
+# --- LAYOUT HEADER WITH METRICS ---
 if not df.empty:
     # DATA CLEANUP
     working_df = df.copy()
@@ -140,26 +134,98 @@ if not df.empty:
     working_df["Start Date"] = pd.to_datetime(working_df["Start Date"], errors='coerce')
     working_df["Start Date"] = working_df["Start Date"].fillna(working_df["End Date"])
     
-    table_df = working_df.copy()
-    timeline_df = working_df.dropna(subset=["End Date"])
-
     today = pd.Timestamp.now().normalize()
-    next_week = today + timedelta(days=7)
-    
-    # "Green" is Active, not Done
+    current_year = today.year
     done_statuses = ["Complete", "Done", "Shipped", "Cancelled", "Complete / Shipped"]
 
-    # FILTER
+    # --- TOP METRICS CALCULATION ---
+    # 1. Total Projects in Flight (Unique Project names that have active tasks)
+    active_rows = working_df[~working_df["Status"].isin(done_statuses)]
+    projects_in_flight = len(active_rows["Project"].unique())
+    
+    # 2. Started This Year (Projects with any task starting in 2025)
+    started_ytd = len(working_df[working_df["Start Date"].dt.year == current_year]["Project"].unique())
+
+    # 3. Completed This Year (Projects with tasks ending in 2025 that are marked done)
+    # Note: If projects are archived/moved, this number will only show what's left in the folder.
+    completed_rows = working_df[
+        (working_df["Status"].isin(done_statuses)) & 
+        (working_df["End Date"].dt.year == current_year)
+    ]
+    completed_ytd = len(completed_rows["Project"].unique())
+
+    # --- HEADER UI ---
+    col_header_1, col_header_2, col_header_3, col_header_4 = st.columns([2, 1, 1, 1])
+    
+    with col_header_1:
+        st.title("🚀 Project Media Hub")
+    with col_header_2:
+        st.metric("✈️ Projects In Flight", projects_in_flight)
+    with col_header_3:
+        st.metric("🏁 Started (YTD)", started_ytd)
+    with col_header_4:
+        st.metric("✅ Active Completed (YTD)", completed_ytd)
+    
+    st.divider()
+
+    # --- FILTER ---
     st.sidebar.header("Filters")
     people = sorted([x for x in working_df["Assigned To"].unique() if x is not None])
     selected_person = st.sidebar.selectbox("Filter by Person", ["All"] + people)
+    
+    # Apply Filters
+    table_df = working_df.copy()
+    timeline_df = working_df.dropna(subset=["End Date"])
     
     if selected_person != "All":
         table_df = table_df[table_df["Assigned To"] == selected_person]
         timeline_df = timeline_df[timeline_df["Assigned To"] == selected_person]
 
-    # 1. GANTT
-    st.subheader(f"📅 Timeline: {selected_person}")
+    # ==========================================
+    # 1. RESOURCE GANTT (NEW!)
+    # ==========================================
+    st.subheader("👥 Resource Schedule (Next 30 Days)")
+    
+    # Filter for next 30 days window
+    next_30 = today + timedelta(days=30)
+    resource_view = timeline_df[
+        (timeline_df["End Date"] >= today) & 
+        (timeline_df["Start Date"] <= next_30) &
+        (~timeline_df["Status"].isin(done_statuses))
+    ]
+    
+    if not resource_view.empty:
+        # Sort by person so the chart is grouped nicely
+        resource_view = resource_view.sort_values("Assigned To")
+        
+        fig_resource = px.timeline(
+            resource_view, 
+            x_start="Start Date", 
+            x_end="End Date", 
+            y="Assigned To",  # Y-Axis is now PEOPLE
+            color="Project",  # Color is Project
+            hover_data=["Task", "Status"],
+            height=350 + (len(resource_view["Assigned To"].unique()) * 30), # Dynamic height based on people count
+            title="Who is working on what?"
+        )
+        
+        # Configure X-Axis to show days clearly
+        fig_resource.update_xaxes(
+            dtick="D1",  # Tick every 1 Day
+            tickformat="%d\n%b", # Format: Day / Month
+            range=[today, next_30] # Lock view to next 30 days
+        )
+        fig_resource.update_yaxes(autorange="reversed") 
+        st.plotly_chart(fig_resource, use_container_width=True)
+    else:
+        st.info("No active scheduled work for the next 30 days.")
+
+    st.divider()
+
+    # ==========================================
+    # 2. PROJECT TIMELINE (Original)
+    # ==========================================
+    st.subheader(f"📅 Project Timeline: {selected_person}")
     if not timeline_df.empty:
         gantt = timeline_df.sort_values("Start Date")
         fig = px.timeline(gantt, x_start="Start Date", x_end="End Date", y="Task", color="Project", hover_data=["Status"])
@@ -170,30 +236,24 @@ if not df.empty:
 
     st.divider()
 
-    # 2. SLIPPAGE
-    st.subheader("🚨 Slippage Meter")
-    overdue = timeline_df[(timeline_df["End Date"] < today) & (~timeline_df["Status"].isin(done_statuses))]
-    
-    c1, c2 = st.columns([1,3])
-    c1.metric("Overdue", len(overdue), delta=-len(overdue), delta_color="inverse")
-    if not overdue.empty:
-        st.dataframe(overdue[["Project", "Task", "End Date", "Status"]], use_container_width=True, hide_index=True)
-    else:
-        st.success("On track!")
-
-    st.divider()
-
-    # 3. HEATMAP
-    st.subheader("🔥 Workload")
-    active = table_df[~table_df["Status"].isin(done_statuses)]
-    if not active.empty:
-        counts = active["Assigned To"].value_counts() if selected_person == "All" else active["Project"].value_counts()
-        st.bar_chart(counts, color="#FF4B4B")
+    # 3. SLIPPAGE
+    col_slip_1, col_slip_2 = st.columns([2,1])
+    with col_slip_1:
+        st.subheader("🚨 Slippage Meter")
+        overdue = timeline_df[(timeline_df["End Date"] < today) & (~timeline_df["Status"].isin(done_statuses))]
+        if not overdue.empty:
+            st.dataframe(overdue[["Project", "Task", "End Date", "Assigned To"]], use_container_width=True, hide_index=True)
+        else:
+            st.success("On track!")
+            
+    with col_slip_2:
+        st.metric("Total Overdue", len(overdue), delta=-len(overdue), delta_color="inverse")
 
     st.divider()
 
     # 4. URGENT
     st.subheader("⚠️ Due Next 7 Days")
+    next_week = today + timedelta(days=7)
     urgent = timeline_df[
         (timeline_df["End Date"] >= today) & 
         (timeline_df["End Date"] <= next_week) & 
@@ -207,76 +267,57 @@ if not df.empty:
 
     st.divider()
 
-    # 5. FULL LIST
+    # 5. HEATMAP & LIST
+    st.subheader("🔥 Workload")
+    active = table_df[~table_df["Status"].isin(done_statuses)]
+    if not active.empty:
+        counts = active["Assigned To"].value_counts() if selected_person == "All" else active["Project"].value_counts()
+        st.bar_chart(counts, color="#FF4B4B")
+
     st.subheader("📋 Detailed Task List")
     st.dataframe(table_df[["Project", "Task", "Status", "End Date", "Assigned To"]], use_container_width=True, hide_index=True)
 
     st.divider()
 
     # ==========================================
-    # 6. AI REPORT AGENT (Gemini)
+    # 6. AI REPORT AGENT
     # ==========================================
     st.subheader("🤖 AI Morning Briefing")
     
     if st.button("✨ Generate Email Report with Gemini"):
         if "GOOGLE_API_KEY" not in st.secrets:
-            st.error("Please add your GOOGLE_API_KEY to Streamlit Secrets to use this feature.")
+            st.error("Please add your GOOGLE_API_KEY to Streamlit Secrets.")
         else:
-            with st.spinner("Gemini is analyzing your projects..."):
-                # A. PREPARE THE DATA
-                # We summarize data to keep it efficient for the AI model
-                
-                total_proj = len(working_df["Project"].unique())
-                active_people_count = len(working_df["Assigned To"].unique())
-                overdue_count = len(overdue)
-                urgent_count = len(urgent)
-                
-                # Get the top 15 overdue/urgent items as a text string
+            with st.spinner("Gemini is analyzing..."):
+                # Data Prep
                 overdue_txt = overdue[["Project", "Task", "Assigned To", "End Date"]].head(15).to_string(index=False)
                 urgent_txt = urgent[["Project", "Task", "Assigned To", "End Date"]].head(15).to_string(index=False)
                 
-                # B. CRAFT THE PROMPT
                 prompt = f"""
-                You are a senior Project Management Assistant for a Media Production team.
-                Write a "Morning Briefing" email for the Head of Production based on the real-time data below.
-
-                **Dashboard Summary:**
-                - Active Projects: {total_proj}
-                - Team Members Active: {active_people_count}
-                - CRITICAL OVERDUE TASKS: {overdue_count}
-                - URGENT TASKS (Next 7 Days): {urgent_count}
-
-                **Context:**
-                - If there are overdue tasks, tone should be "Urgent Action Required".
-                - If no overdue tasks, tone should be "On Track / Informational".
+                Act as a Senior Project Manager. Write a morning briefing email.
                 
-                **Specific Data to Highlight:**
+                **Global Metrics:**
+                - Projects In Flight: {projects_in_flight}
+                - Projects Started YTD: {started_ytd}
+                - Active Completed YTD: {completed_ytd}
+                - Overdue Tasks: {len(overdue)}
                 
-                [OVERDUE LIST - HIGH PRIORITY]
+                **Critical Items:**
                 {overdue_txt}
                 
-                [UPCOMING DEADLINES - NEXT 7 DAYS]
+                **Upcoming:**
                 {urgent_txt}
                 
-                **Email Instructions:**
-                1. Subject Line: Crisp and status-driven (e.g., "🔴 Production Risk Report" or "🟢 Weekly Status").
-                2. Executive Summary: 2-3 sentences.
-                3. The "Red Flags": Bullet points of overdue items.
-                4. The "Look Ahead": Bullet points of what is due this week.
-                5. Keep it professional, concise, and formatted for easy reading.
+                Write a concise, bulleted email summary.
                 """
                 
-                # C. CALL GEMINI
                 try:
-                    # Use Gemini 1.5 Flash (Fast & Cheap)
                     model = genai.GenerativeModel('gemini-1.5-flash')
                     response = model.generate_content(prompt)
-                    
                     st.success("Draft Generated!")
-                    st.text_area("📧 Copy Your Email Draft:", value=response.text, height=500)
-                    
+                    st.text_area("📧 Email Draft:", value=response.text, height=500)
                 except Exception as e:
-                    st.error(f"Gemini API Error: {e}")
+                    st.error(f"AI Error: {e}")
 
 else:
     st.error("❌ No Data Found. Check Folder ID.")
