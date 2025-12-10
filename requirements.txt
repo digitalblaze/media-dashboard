@@ -2,3 +2,4 @@ streamlit
 smartsheet-python-sdk
 pandas
 plotly
+google-generativeai
