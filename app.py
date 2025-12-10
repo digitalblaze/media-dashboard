@@ -43,6 +43,19 @@ def get_cell_value(row, col_id):
             return cell.value
     return None
 
+# --- NEW: DYNAMIC MODEL FINDER ---
+def get_flash_model():
+    """Loops through available models to find a valid Flash version."""
+    try:
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                if 'flash' in m.name.lower():
+                    return m.name
+        # Fallback if no specific 'flash' model is found
+        return 'gemini-1.5-flash'
+    except:
+        return 'gemini-1.5-flash'
+
 # --- DATA ENGINE ---
 def fetch_data_from_api(root_id):
     all_rows = []
@@ -97,7 +110,7 @@ def fetch_data_from_api(root_id):
                 if not task_val: continue
                 
                 all_rows.append({
-                    "Project": item["context"], # Folder Name is Project Name
+                    "Project": item["context"], 
                     "Task": task_val,
                     "Status": get_cell_value(row, status_id) or "Not Started",
                     "Assigned To": get_cell_value(row, assign_id) or "Unassigned",
@@ -139,15 +152,9 @@ if not df.empty:
     done_statuses = ["Complete", "Done", "Shipped", "Cancelled", "Complete / Shipped"]
 
     # --- TOP METRICS CALCULATION ---
-    # 1. Total Projects in Flight (Unique Project names that have active tasks)
     active_rows = working_df[~working_df["Status"].isin(done_statuses)]
     projects_in_flight = len(active_rows["Project"].unique())
-    
-    # 2. Started This Year (Projects with any task starting in 2025)
     started_ytd = len(working_df[working_df["Start Date"].dt.year == current_year]["Project"].unique())
-
-    # 3. Completed This Year (Projects with tasks ending in 2025 that are marked done)
-    # Note: If projects are archived/moved, this number will only show what's left in the folder.
     completed_rows = working_df[
         (working_df["Status"].isin(done_statuses)) & 
         (working_df["End Date"].dt.year == current_year)
@@ -173,7 +180,6 @@ if not df.empty:
     people = sorted([x for x in working_df["Assigned To"].unique() if x is not None])
     selected_person = st.sidebar.selectbox("Filter by Person", ["All"] + people)
     
-    # Apply Filters
     table_df = working_df.copy()
     timeline_df = working_df.dropna(subset=["End Date"])
     
@@ -182,11 +188,10 @@ if not df.empty:
         timeline_df = timeline_df[timeline_df["Assigned To"] == selected_person]
 
     # ==========================================
-    # 1. RESOURCE GANTT (NEW!)
+    # 1. RESOURCE GANTT
     # ==========================================
     st.subheader("👥 Resource Schedule (Next 30 Days)")
     
-    # Filter for next 30 days window
     next_30 = today + timedelta(days=30)
     resource_view = timeline_df[
         (timeline_df["End Date"] >= today) & 
@@ -195,26 +200,16 @@ if not df.empty:
     ]
     
     if not resource_view.empty:
-        # Sort by person so the chart is grouped nicely
         resource_view = resource_view.sort_values("Assigned To")
-        
         fig_resource = px.timeline(
             resource_view, 
-            x_start="Start Date", 
-            x_end="End Date", 
-            y="Assigned To",  # Y-Axis is now PEOPLE
-            color="Project",  # Color is Project
+            x_start="Start Date", x_end="End Date", 
+            y="Assigned To", color="Project",
             hover_data=["Task", "Status"],
-            height=350 + (len(resource_view["Assigned To"].unique()) * 30), # Dynamic height based on people count
+            height=350 + (len(resource_view["Assigned To"].unique()) * 30),
             title="Who is working on what?"
         )
-        
-        # Configure X-Axis to show days clearly
-        fig_resource.update_xaxes(
-            dtick="D1",  # Tick every 1 Day
-            tickformat="%d\n%b", # Format: Day / Month
-            range=[today, next_30] # Lock view to next 30 days
-        )
+        fig_resource.update_xaxes(dtick="D1", tickformat="%d\n%b", range=[today, next_30])
         fig_resource.update_yaxes(autorange="reversed") 
         st.plotly_chart(fig_resource, use_container_width=True)
     else:
@@ -223,7 +218,7 @@ if not df.empty:
     st.divider()
 
     # ==========================================
-    # 2. PROJECT TIMELINE (Original)
+    # 2. PROJECT TIMELINE
     # ==========================================
     st.subheader(f"📅 Project Timeline: {selected_person}")
     if not timeline_df.empty:
@@ -280,7 +275,7 @@ if not df.empty:
     st.divider()
 
     # ==========================================
-    # 6. AI REPORT AGENT
+    # 6. AI REPORT AGENT (DYNAMIC MODEL)
     # ==========================================
     st.subheader("🤖 AI Morning Briefing")
     
@@ -288,7 +283,7 @@ if not df.empty:
         if "GOOGLE_API_KEY" not in st.secrets:
             st.error("Please add your GOOGLE_API_KEY to Streamlit Secrets.")
         else:
-            with st.spinner("Gemini is analyzing..."):
+            with st.spinner("Finding best model & analyzing..."):
                 # Data Prep
                 overdue_txt = overdue[["Project", "Task", "Assigned To", "End Date"]].head(15).to_string(index=False)
                 urgent_txt = urgent[["Project", "Task", "Assigned To", "End Date"]].head(15).to_string(index=False)
@@ -312,7 +307,11 @@ if not df.empty:
                 """
                 
                 try:
-                    model = genai.GenerativeModel('gemini-pro')
+                    # DYNAMICALLY FIND A WORKING 'FLASH' MODEL
+                    model_name = get_flash_model()
+                    st.caption(f"Using AI Model: {model_name}") # Shows you which model picked
+                    
+                    model = genai.GenerativeModel(model_name)
                     response = model.generate_content(prompt)
                     st.success("Draft Generated!")
                     st.text_area("📧 Email Draft:", value=response.text, height=500)
@@ -321,4 +320,3 @@ if not df.empty:
 
 else:
     st.error("❌ No Data Found. Check Folder ID.")
-
