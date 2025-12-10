@@ -7,7 +7,7 @@ import time
 
 # --- CONFIGURATION ---
 # PASTE YOUR ACTIVE PROJECTS FOLDER ID HERE
-ROOT_ID = 6632675466340228 
+ROOT_ID = 6632675466340228
 
 TARGET_FILE_KEYWORD = "Project Plan"
 
@@ -33,10 +33,20 @@ def get_specific_col_id(sheet, target_names):
     return None
 
 def get_cell_value(row, col_id):
+    """
+    ROBUST GETTER: Checks display_value first, then falls back to raw value.
+    This fixes the 'blank date' bug.
+    """
     if not col_id: return None
     cell = next((c for c in row.cells if c.column_id == col_id), None)
-    if cell and cell.display_value:
-        return cell.display_value
+    
+    if cell:
+        # Priority 1: The formatted text
+        if hasattr(cell, 'display_value') and cell.display_value:
+            return cell.display_value
+        # Priority 2: The raw value (Critical for Dates!)
+        if hasattr(cell, 'value') and cell.value:
+            return cell.value
     return None
 
 # --- DATA ENGINE ---
@@ -72,20 +82,20 @@ def fetch_data_from_api(root_id):
     # 2. DOWNLOAD DATA
     st.write(f"📂 Found {len(found_sheets)} sheets. Reading 'Finish Date' column...")
     progress_bar = st.progress(0)
+    status_text = st.empty()
     
     total_sheets = len(found_sheets)
     
     for i, item in enumerate(found_sheets):
         progress_bar.progress((i + 1) / total_sheets)
+        status_text.text(f"Scanning {i+1}/{total_sheets}: {item['sheet'].name}")
         
         try:
             sheet = ss_client.Sheets.get_sheet(item["sheet"].id)
             
-            # --- STRICT MAPPING (THE FIX) ---
-            # We explicitly REMOVED "End Date" from this list so it can't grab the empty column.
-            # We ONLY look for "Finish Date" (and "Target End Date" as a fallback).
+            # --- STRICT MAPPING ---
+            # Using Finish Date as primary source
             end_date_id = get_specific_col_id(sheet, ["Finish Date", "Target End Date", "Finish"])
-            
             start_date_id = get_specific_col_id(sheet, ["Start Date", "Target Start Date", "Start"])
             status_id = get_specific_col_id(sheet, ["Status", "% Complete", "Progress"])
             assign_id = get_specific_col_id(sheet, ["Assigned To", "Project Owner", "Functional Owner"])
@@ -101,12 +111,13 @@ def fetch_data_from_api(root_id):
                     "Status": get_cell_value(row, status_id) or "Not Started",
                     "Assigned To": get_cell_value(row, assign_id) or "Unassigned",
                     "Start Date": get_cell_value(row, start_date_id),
-                    "End Date": get_cell_value(row, end_date_id), # This will now pull from Finish Date
+                    "End Date": get_cell_value(row, end_date_id),
                     "Link": row.permalink
                 })
         except: continue
         
     progress_bar.empty()
+    status_text.empty()
     return pd.DataFrame(all_rows)
 
 # --- APP STARTUP ---
@@ -136,11 +147,10 @@ if not df.empty:
     table_df = working_df.copy()
     timeline_df = working_df.dropna(subset=["End Date"])
 
-    # FIX: Normalize Today's Date
     today = pd.Timestamp.now().normalize()
     next_week = today + timedelta(days=7)
     
-    # FIX: "Green" is now considered Active, not Done
+    # Statuses that mean "Work is over"
     done_statuses = ["Complete", "Done", "Shipped", "Cancelled", "Complete / Shipped"]
 
     # FILTER
