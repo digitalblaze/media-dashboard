@@ -7,7 +7,7 @@ import time
 
 # --- CONFIGURATION ---
 # PASTE YOUR ACTIVE PROJECTS FOLDER ID HERE
-ROOT_ID = 6632675466340228 
+ROOT_ID = 3438747011311492 
 
 TARGET_FILE_KEYWORD = "Project Plan"
 
@@ -36,43 +36,48 @@ def get_first_val(row, col_ids):
             return cell.display_value
     return None
 
-# --- DATA ENGINE (ONLY RUNS ONCE) ---
+# --- DATA ENGINE ---
 def fetch_data_from_api(root_id):
     all_rows = []
     found_sheets = []
     
-    # 1. Connect
-    try:
-        root_obj = ss_client.Workspaces.get_workspace(root_id)
-    except:
+    # 1. CONNECT & SCAN
+    with st.spinner('Connecting to Smartsheet API...'):
         try:
-            root_obj = ss_client.Folders.get_folder(root_id)
-        except:
+            try:
+                root_obj = ss_client.Workspaces.get_workspace(root_id)
+            except:
+                root_obj = ss_client.Folders.get_folder(root_id)
+            
+            def scan(container):
+                if hasattr(container, 'sheets'):
+                    for s in container.sheets:
+                        if TARGET_FILE_KEYWORD.lower() in s.name.lower():
+                            found_sheets.append({"sheet": s, "context": container.name})
+                if hasattr(container, 'folders'):
+                    for f in container.folders:
+                        try:
+                            full = ss_client.Folders.get_folder(f.id)
+                            scan(full)
+                        except: continue
+            scan(root_obj)
+            
+        except Exception as e:
+            st.error(f"Connection Error: {e}")
             return pd.DataFrame()
 
-    # 2. Scan
-    placeholder = st.empty()
-    placeholder.info("🔄 Connecting to Smartsheet API...")
+    # 2. DOWNLOAD DATA
+    st.write(f"📂 Found {len(found_sheets)} sheets. Downloading data...")
+    progress_bar = st.progress(0)
+    status_text = st.empty()
     
-    def scan(container):
-        if hasattr(container, 'sheets'):
-            for s in container.sheets:
-                if TARGET_FILE_KEYWORD.lower() in s.name.lower():
-                    found_sheets.append({"sheet": s, "context": container.name})
-        if hasattr(container, 'folders'):
-            for f in container.folders:
-                try:
-                    full = ss_client.Folders.get_folder(f.id)
-                    scan(full)
-                except: continue
-    scan(root_obj)
+    total_sheets = len(found_sheets)
     
-    placeholder.info(f"📂 Found {len(found_sheets)} sheets. Downloading data...")
-
-    # 3. Extract
-    progress = st.progress(0)
     for i, item in enumerate(found_sheets):
-        progress.progress((i+1)/len(found_sheets))
+        current_progress = (i + 1) / total_sheets
+        progress_bar.progress(current_progress)
+        status_text.text(f"Reading file {i+1}/{total_sheets}: {item['sheet'].name}")
+        
         try:
             sheet = ss_client.Sheets.get_sheet(item["sheet"].id)
             
@@ -98,51 +103,47 @@ def fetch_data_from_api(root_id):
                 })
         except: continue
         
-    progress.empty()
-    placeholder.empty()
+    progress_bar.empty()
+    status_text.empty()
+    
     return pd.DataFrame(all_rows)
 
 # --- APP STARTUP ---
 st.set_page_config(layout="wide", page_title="Media Hub")
 
-# SIDEBAR: REFRESH BUTTON
+# CONTROLS
 st.sidebar.title("Controls")
 if st.sidebar.button("🔄 Refresh Data Now"):
-    # Clear session state to force a re-run
     if "master_df" in st.session_state:
         del st.session_state["master_df"]
     st.rerun()
 
-# SESSION STATE LOGIC (The Magic Fix)
 if "master_df" not in st.session_state:
-    # Data is not in memory, so we fetch it
     st.session_state["master_df"] = fetch_data_from_api(ROOT_ID)
 
-# Now we just read from memory (Instant!)
 df = st.session_state["master_df"]
 
 st.title("🚀 Project Media Hub")
 
 if not df.empty:
-    # --- DATA CLEANUP ---
-    # We do cleanup on the filtered view to avoid mutating the master cache
+    # DATA CLEANUP
     working_df = df.copy()
-    
     working_df["End Date"] = pd.to_datetime(working_df["End Date"], errors='coerce')
     working_df["Start Date"] = pd.to_datetime(working_df["Start Date"], errors='coerce')
     working_df["Start Date"] = working_df["Start Date"].fillna(working_df["End Date"])
     
-    # 1. TOTAL TABLE (Shows Everything)
     table_df = working_df.copy()
-    
-    # 2. TIMELINE (Needs Dates)
     timeline_df = working_df.dropna(subset=["End Date"])
 
-    today = pd.Timestamp.now()
+    # --- FIX 1: Normalize Today's Date (Fixes "Midnight Bug") ---
+    today = pd.Timestamp.now().normalize()
     next_week = today + timedelta(days=7)
-    done_statuses = ["Complete", "Done", "Shipped", "Cancelled", "Green", "Blue"]
+    
+    # --- FIX 2: Relaxed Done Statuses (Fixes "Green Trap") ---
+    # Removed "Green" and "Blue" so they count as ACTIVE work
+    done_statuses = ["Complete", "Done", "Shipped", "Cancelled", "Complete / Shipped"]
 
-    # --- FILTER SIDEBAR ---
+    # FILTER
     st.sidebar.header("Filters")
     people = sorted([x for x in working_df["Assigned To"].unique() if x is not None])
     selected_person = st.sidebar.selectbox("Filter by Person", ["All"] + people)
@@ -159,7 +160,7 @@ if not df.empty:
         fig.update_yaxes(autorange="reversed") 
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("No tasks with dates found for this view.")
+        st.info("No timeline data found.")
 
     st.divider()
 
@@ -186,7 +187,16 @@ if not df.empty:
 
     # 4. URGENT
     st.subheader("⚠️ Due Next 7 Days")
-    urgent = timeline_df[(timeline_df["End Date"] >= today) & (timeline_df["End Date"] <= next_week) & (~timeline_df["Status"].isin(done_statuses))]
+    # Filters: 
+    # 1. Date is >= Today
+    # 2. Date is <= Next Week
+    # 3. Status is NOT in "Done" list (Green/Blue will now SHOW UP)
+    urgent = timeline_df[
+        (timeline_df["End Date"] >= today) & 
+        (timeline_df["End Date"] <= next_week) & 
+        (~timeline_df["Status"].isin(done_statuses))
+    ]
+    
     if not urgent.empty:
         for i, row in urgent.iterrows():
             st.warning(f"**{row['Project']}**: {row['Task']} (Due {row['End Date'].strftime('%Y-%m-%d')})")
@@ -201,4 +211,3 @@ if not df.empty:
 
 else:
     st.error("❌ No Data Found. Check Folder ID.")
-
