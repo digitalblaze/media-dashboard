@@ -2,12 +2,13 @@ import streamlit as st
 import smartsheet
 import pandas as pd
 import plotly.express as px
+import google.generativeai as genai  # <--- NEW LIBRARY
 from datetime import datetime, timedelta
 import time
 
 # --- CONFIGURATION ---
 # PASTE YOUR ACTIVE PROJECTS FOLDER ID HERE
-ROOT_ID = 6632675466340228
+ROOT_ID = 6632675466340228 
 
 TARGET_FILE_KEYWORD = "Project Plan"
 
@@ -16,16 +17,18 @@ try:
     ss_client = smartsheet.Smartsheet(st.secrets["SMARTSHEET_ACCESS_TOKEN"])
     ss_client.errors_as_exceptions(True)
 except Exception as e:
-    st.error(f"API Connection Failed: {e}")
+    st.error(f"Smartsheet API Error: {e}")
     st.stop()
+
+# Configure Gemini
+if "GOOGLE_API_KEY" in st.secrets:
+    genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+else:
+    st.warning("⚠️ Google API Key missing in Secrets. AI features will be disabled.")
 
 # --- HELPER FUNCTIONS ---
 def get_specific_col_id(sheet, target_names):
-    """
-    Strictly looks for the specific column names we want.
-    """
     sheet_cols = {c.title.strip().lower(): c.id for c in sheet.columns}
-    
     for name in target_names:
         clean_name = name.strip().lower()
         if clean_name in sheet_cols:
@@ -33,18 +36,12 @@ def get_specific_col_id(sheet, target_names):
     return None
 
 def get_cell_value(row, col_id):
-    """
-    ROBUST GETTER: Checks display_value first, then falls back to raw value.
-    This fixes the 'blank date' bug.
-    """
     if not col_id: return None
     cell = next((c for c in row.cells if c.column_id == col_id), None)
-    
+    # Check display_value first (formatted), then raw value
     if cell:
-        # Priority 1: The formatted text
         if hasattr(cell, 'display_value') and cell.display_value:
             return cell.display_value
-        # Priority 2: The raw value (Critical for Dates!)
         if hasattr(cell, 'value') and cell.value:
             return cell.value
     return None
@@ -80,7 +77,7 @@ def fetch_data_from_api(root_id):
             return pd.DataFrame()
 
     # 2. DOWNLOAD DATA
-    st.write(f"📂 Found {len(found_sheets)} sheets. Reading 'Finish Date' column...")
+    st.write(f"📂 Found {len(found_sheets)} sheets. Downloading data...")
     progress_bar = st.progress(0)
     status_text = st.empty()
     
@@ -93,8 +90,7 @@ def fetch_data_from_api(root_id):
         try:
             sheet = ss_client.Sheets.get_sheet(item["sheet"].id)
             
-            # --- STRICT MAPPING ---
-            # Using Finish Date as primary source
+            # MAPPING
             end_date_id = get_specific_col_id(sheet, ["Finish Date", "Target End Date", "Finish"])
             start_date_id = get_specific_col_id(sheet, ["Start Date", "Target Start Date", "Start"])
             status_id = get_specific_col_id(sheet, ["Status", "% Complete", "Progress"])
@@ -123,7 +119,7 @@ def fetch_data_from_api(root_id):
 # --- APP STARTUP ---
 st.set_page_config(layout="wide", page_title="Media Hub")
 
-# CONTROLS
+# SIDEBAR CONTROLS
 st.sidebar.title("Controls")
 if st.sidebar.button("🔄 Refresh Data Now"):
     if "master_df" in st.session_state:
@@ -150,7 +146,7 @@ if not df.empty:
     today = pd.Timestamp.now().normalize()
     next_week = today + timedelta(days=7)
     
-    # Statuses that mean "Work is over"
+    # "Green" is Active, not Done
     done_statuses = ["Complete", "Done", "Shipped", "Cancelled", "Complete / Shipped"]
 
     # FILTER
@@ -170,13 +166,14 @@ if not df.empty:
         fig.update_yaxes(autorange="reversed") 
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("No timeline data found (Finish Date missing).")
+        st.info("No timeline data found.")
 
     st.divider()
 
     # 2. SLIPPAGE
     st.subheader("🚨 Slippage Meter")
     overdue = timeline_df[(timeline_df["End Date"] < today) & (~timeline_df["Status"].isin(done_statuses))]
+    
     c1, c2 = st.columns([1,3])
     c1.metric("Overdue", len(overdue), delta=-len(overdue), delta_color="inverse")
     if not overdue.empty:
@@ -213,6 +210,73 @@ if not df.empty:
     # 5. FULL LIST
     st.subheader("📋 Detailed Task List")
     st.dataframe(table_df[["Project", "Task", "Status", "End Date", "Assigned To"]], use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ==========================================
+    # 6. AI REPORT AGENT (Gemini)
+    # ==========================================
+    st.subheader("🤖 AI Morning Briefing")
+    
+    if st.button("✨ Generate Email Report with Gemini"):
+        if "GOOGLE_API_KEY" not in st.secrets:
+            st.error("Please add your GOOGLE_API_KEY to Streamlit Secrets to use this feature.")
+        else:
+            with st.spinner("Gemini is analyzing your projects..."):
+                # A. PREPARE THE DATA
+                # We summarize data to keep it efficient for the AI model
+                
+                total_proj = len(working_df["Project"].unique())
+                active_people_count = len(working_df["Assigned To"].unique())
+                overdue_count = len(overdue)
+                urgent_count = len(urgent)
+                
+                # Get the top 15 overdue/urgent items as a text string
+                overdue_txt = overdue[["Project", "Task", "Assigned To", "End Date"]].head(15).to_string(index=False)
+                urgent_txt = urgent[["Project", "Task", "Assigned To", "End Date"]].head(15).to_string(index=False)
+                
+                # B. CRAFT THE PROMPT
+                prompt = f"""
+                You are a senior Project Management Assistant for a Media Production team.
+                Write a "Morning Briefing" email for the Head of Production based on the real-time data below.
+
+                **Dashboard Summary:**
+                - Active Projects: {total_proj}
+                - Team Members Active: {active_people_count}
+                - CRITICAL OVERDUE TASKS: {overdue_count}
+                - URGENT TASKS (Next 7 Days): {urgent_count}
+
+                **Context:**
+                - If there are overdue tasks, tone should be "Urgent Action Required".
+                - If no overdue tasks, tone should be "On Track / Informational".
+                
+                **Specific Data to Highlight:**
+                
+                [OVERDUE LIST - HIGH PRIORITY]
+                {overdue_txt}
+                
+                [UPCOMING DEADLINES - NEXT 7 DAYS]
+                {urgent_txt}
+                
+                **Email Instructions:**
+                1. Subject Line: Crisp and status-driven (e.g., "🔴 Production Risk Report" or "🟢 Weekly Status").
+                2. Executive Summary: 2-3 sentences.
+                3. The "Red Flags": Bullet points of overdue items.
+                4. The "Look Ahead": Bullet points of what is due this week.
+                5. Keep it professional, concise, and formatted for easy reading.
+                """
+                
+                # C. CALL GEMINI
+                try:
+                    # Use Gemini 1.5 Flash (Fast & Cheap)
+                    model = genai.GenerativeModel('gemini-1.5-flash')
+                    response = model.generate_content(prompt)
+                    
+                    st.success("Draft Generated!")
+                    st.text_area("📧 Copy Your Email Draft:", value=response.text, height=500)
+                    
+                except Exception as e:
+                    st.error(f"Gemini API Error: {e}")
 
 else:
     st.error("❌ No Data Found. Check Folder ID.")
